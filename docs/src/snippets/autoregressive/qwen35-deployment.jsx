@@ -67,6 +67,7 @@ export const Qwen35Deployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
+          { id: 'a3',     label: 'Ascend A3', default: false,  disabled: isNvfp4 },
           { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 },
           { id: 'arc_b',  label: 'BMG',    default: false,     disabled: isNvfp4 }
         ];
@@ -80,12 +81,43 @@ export const Qwen35Deployment = () => {
         const hasFp4 = values.model === '397b';
         const isXeon = values.hardware === 'xeon';
         const isArcB = values.hardware === 'arc_b';
+        const isA3 = values.hardware === 'a3';
         return [
-          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon || isArcB },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon && !isArcB, disabled: !hasFp8 || isArcB,
-            disabledReason: 'No FP8 variant available for this model' },
-          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon || isArcB,
-            disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
+          { id: 'bf16', label: 'BF16', default: (!hasFp8 || isXeon || isArcB) && !isA3, disabled: isA3,
+            disabledReason: 'No validated BF16 recipe for Ascend A3 — use the W4A8 checkpoint' },
+          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon && !isArcB && !isA3, disabled: !hasFp8 || isArcB || isA3,
+            disabledReason: isA3 ? 'No validated FP8 recipe for Ascend A3 — use the W4A8 checkpoint' : 'No FP8 variant available for this model' },
+          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon || isArcB || isA3,
+            disabledReason: isA3 ? 'No validated FP4 recipe for Ascend A3 — use the W4A8 checkpoint' : (isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B') },
+          { id: 'w4a8', label: 'W4A8', default: isA3,    disabled: !isA3,
+            disabledReason: 'W4A8 (modelslim) is the validated quantization on Ascend A3' }
+        ];
+      }
+    },
+    contextLen: {
+      name: 'contextLen',
+      title: 'Workload (In+Out)',
+      condition: (values) => values.hardware === 'a3',
+      items: [
+        { id: '3.5k', label: '3.5K+1.5K', default: true  },
+        { id: '16k',  label: '16K+1K',    default: false },
+        { id: '64k',  label: '64K+1K',    default: false },
+        { id: '128k', label: '128K+1K',   default: false },
+      ]
+    },
+    profile: {
+      name: 'profile',
+      title: 'Optimization Goal',
+      condition: (values) => values.hardware === 'a3',
+      getDynamicItems: (values) => {
+        const ctx = A3_RECIPES[values.contextLen] || A3_RECIPES['3.5k'];
+        const hasP90 = !!ctx.p90;
+        return [
+          { id: 'll',  label: `Low Latency (${ctx.ll.tpot} TPOT)`, default: true  },
+          { id: 'ht',  label: `High Throughput (${ctx.ht.tpot} TPOT)`, default: false },
+          { id: 'p90', label: hasP90 ? `High Throughput + 90% Prefix Hit (${ctx.p90.tpot} TPOT)` : 'High Throughput + 90% Prefix Hit',
+            default: false, disabled: !hasP90,
+            disabledReason: 'The 90% prefix-cache recipe is tuned for the 64K/128K workloads only' }
         ];
       }
     },
@@ -108,7 +140,9 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'arc_b',
+      // Ascend A3 recipes always ship MTP (NEXTN) — the radio is hidden and the
+      // flags are baked into each scenario, matching the best-practice doc.
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'arc_b' && values.hardware !== 'a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -131,7 +165,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'arc_b',
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'arc_b' && values.hardware !== 'a3',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -264,6 +298,515 @@ export const Qwen35Deployment = () => {
     }
   };
 
+  // ---------------------------------------------------------------------
+  // Ascend A3 recipes (Qwen3.5-397B-A17B, PD mixed on one A3 node = 8 cards =
+  // 16 dies, --tp-size 16, W4A8 modelslim quantization).
+  //
+  // env/flags are transcribed verbatim (same line order, values unchanged)
+  // from the validated best-practice doc:
+  //   docs/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b.mdx
+  // The generator prepends MODEL_PATH, appends the parser flags (radio-driven)
+  // and --host/--port (cookbook convention: 0.0.0.0:30000), and swaps the
+  // doc's `python3 -m sglang.launch_server` for `sglang serve`.
+  // Checkpoint: ModelScope Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp (235.88GB).
+  // Key: [contextLen][profile] -> { tpot, env, flags }.
+  const A3_RECIPES = {
+    '3.5k': {
+      ll: {
+        tpot: '22.2ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 35000
+--max-total-tokens 128000
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 160
+--mem-fraction-static 0.8
+--cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 8
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      ht: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 17500
+--max-total-tokens 280000
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 432
+--mem-fraction-static 0.8
+--cuda-graph-bs-decode 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 8
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      }
+    },
+    '16k': {
+      ll: {
+        tpot: '20ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 50000
+--prefill-max-requests 4
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 48
+--mem-fraction-static 0.8
+--max-total-tokens 210000
+--cuda-graph-bs-decode 2 4 6 8 10 12
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 4
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      ht: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 65536
+--prefill-max-requests 4
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 144
+--mem-fraction-static 0.8
+--max-total-tokens 635000
+--cuda-graph-bs-decode 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 4
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      }
+    },
+    '64k': {
+      ll: {
+        tpot: '20ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 65536
+--prefill-max-requests 1
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 16
+--mem-fraction-static 0.6
+--max-total-tokens 1065000
+--cuda-graph-bs-decode 2 4 6 8 10 12 14 16
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 2
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      ht: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 65536
+--prefill-max-requests 1
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 32
+--mem-fraction-static 0.6
+--max-total-tokens 1065000
+--cuda-graph-bs-decode 2 4 6 8 12 14 16
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 2
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      p90: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2200
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 65536
+--max-mamba-cache-size 640
+--mamba-radix-cache-strategy extra_buffer
+--trust-remote-code
+--max-running-requests 128
+--mem-fraction-static 0.6
+--max-total-tokens 1310720
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--attn-dp-size 2
+--enable-dp-lm-head
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      }
+    },
+    '128k': {
+      ll: {
+        tpot: '20ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=60672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 131072
+--prefill-max-requests 1
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 16
+--mem-fraction-static 0.6
+--cuda-graph-bs-decode 2 3 4 5 6 8 10 12 14 16
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      ht: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=60672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 131072
+--prefill-max-requests 1
+--disable-radix-cache
+--trust-remote-code
+--max-running-requests 16
+--mem-fraction-static 0.6
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      },
+      p90: {
+        tpot: '50ms',
+        env: `export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2200
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32`,
+        flags: `--attention-backend ascend
+--device npu
+--tp-size 16
+--chunked-prefill-size -1
+--max-prefill-tokens 131072
+--max-mamba-cache-size 320
+--prefill-max-requests 10
+--mamba-radix-cache-strategy extra_buffer
+--trust-remote-code
+--max-running-requests 64
+--mem-fraction-static 0.6
+--quantization modelslim
+--enable-multimodal
+--moe-a2a-backend deepep
+--deepep-mode auto
+--mm-attention-backend ascend_attn
+--dtype bfloat16
+--mamba-ssm-dtype bfloat16
+--speculative-algorithm NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--speculative-draft-model-quantization unquant`
+      }
+    }
+  };
+
+  // Builds the Ascend A3 launch command from the selected scenario. Kept as a
+  // separate branch because the NPU recipe carries a per-scenario env preamble
+  // that the GPU/CPU paths don't have.
+  const generateA3Command = () => {
+    const { reasoning, toolcall, contextLen, profile } = values;
+    const recipe = A3_RECIPES[contextLen]?.[profile];
+    if (!recipe) {
+      return '# Please select a valid workload and optimization-goal combination';
+    }
+    let cmd = '# Ascend A3: one node, 8 cards (16 dies), PD mixed, W4A8 (modelslim).\n';
+    cmd += '# One-time host prep: CPU governor = performance, swap off, NUMA balancing off, then\n';
+    cmd += '#   source /usr/local/Ascend/ascend-toolkit/set_env.sh\n';
+    cmd += '#   source /usr/local/Ascend/nnal/atb/set_env.sh\n';
+    cmd += '# Point MODEL_PATH at the W4A8 checkpoint (ModelScope: Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp) and\n';
+    cmd += '# set both socket interface names to your host NIC (check with `ip link`).\n';
+    cmd += 'export MODEL_PATH=<path-to-model-weights>\n';
+    cmd += recipe.env + '\n';
+    cmd += 'sglang serve \\\n  --model-path $MODEL_PATH \\\n  ';
+    cmd += recipe.flags.split('\n').join(' \\\n  ');
+    if (reasoning === 'enabled') {
+      cmd += ' \\\n  --reasoning-parser qwen3';
+    }
+    if (toolcall === 'enabled') {
+      cmd += ' \\\n  --tool-call-parser qwen3_coder';
+    }
+    cmd += ' \\\n  --host 0.0.0.0 \\\n  --port 30000';
+    return cmd;
+  };
+
   const resolveItems = (option, vals) =>
     typeof option.getDynamicItems === 'function' ? option.getDynamicItems(vals) : option.items;
 
@@ -309,17 +852,24 @@ export const Qwen35Deployment = () => {
       }
       return next;
     });
-  }, [values.hardware, values.model]);
+  }, [values.hardware, values.model, values.contextLen]);
 
   const handleRadioChange = (optionName, value) => {
     setValues(prev => {
       if (prev.hardware === 'arc_b' && optionName === 'model' && !['35b', '9b', '4b'].includes(value)) {
         return prev;
       }
+      // Ascend A3 has a validated recipe for the 397B flagship only.
+      if (prev.hardware === 'a3' && optionName === 'model' && value !== '397b') {
+        return prev;
+      }
 
       const next = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'arc_b' && !['35b', '9b', '4b'].includes(next.model)) {
         next.model = '35b';
+      }
+      if (optionName === 'hardware' && value === 'a3' && next.model !== '397b') {
+        next.model = '397b';
       }
       return next;
     });
@@ -344,6 +894,12 @@ export const Qwen35Deployment = () => {
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
     const { model, hardware, quantization, speculative, mambaCache, kvOffload } = values;
+
+    // Ascend A3 has its own generator: per-scenario env preamble + fixed recipe
+    // flags from the best-practice doc.
+    if (hardware === 'a3') {
+      return generateA3Command();
+    }
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -665,7 +1221,11 @@ export const Qwen35Deployment = () => {
                   values.hardware === 'arc_b' &&
                   option.name === 'model' &&
                   !['35b', '9b', '4b'].includes(item.id);
-                const isDisabled = !!item.disabled || isArcBModelLocked;
+                const isA3ModelLocked =
+                  values.hardware === 'a3' &&
+                  option.name === 'model' &&
+                  item.id !== '397b';
+                const isDisabled = !!item.disabled || isArcBModelLocked || isA3ModelLocked;
                 return (
                   <label
                     key={item.id}

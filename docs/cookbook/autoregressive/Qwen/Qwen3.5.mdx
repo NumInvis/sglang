@@ -107,13 +107,16 @@ docker pull lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi30x-20260715
 
 # Or use Docker (AMD MI355X)
 docker pull lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260927
+
+# Or use Docker (Ascend A3 NPUs)
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install). For Ascend NPU environment setup (CANN toolkit, TorchNPU, driver mounts), see the [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) and [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation).
 
 ## 3. Model Deployment
 
-This section provides deployment configurations optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)), and Intel Xeon CPUs.
+This section provides deployment configurations optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, Ascend NPUs, Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)), and Intel Xeon CPUs.
 
 ### 3.1 Basic Configuration
 
@@ -124,6 +127,8 @@ This section provides deployment configurations optimized for different hardware
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **Ascend A3 (NPU):** Selecting **Ascend A3** switches the generator to the validated Qwen3.5-397B-A17B W4A8 recipes — one A3 node, 8 cards (each card has 2 dies, so `--tp-size 16` covers 16 dies), PD mixed, MTP on. Use the W4A8 checkpoint [Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp) (235.88GB, ModelScope) and set `MODEL_PATH` to its local directory. The per-scenario configurations and TPOT targets come from the [Qwen3.5-397B best practice on Ascend NPUs](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b); deployment background is in the [model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
+- **Ascend host preparation:** Before launching on Ascend, set the CPU governor to `performance`, disable swap and NUMA balancing, and source the CANN environment scripts (`source /usr/local/Ascend/ascend-toolkit/set_env.sh` and `source /usr/local/Ascend/nnal/atb/set_env.sh`). Set `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the host network interface name (check with `ip link`), and unset any `http_proxy`/`https_proxy` variables. The full setup walkthrough is in [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation).
 - **H100 / B200 / B300 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings. It only helps when tp > 1, so on B200/B300 it applies to the 397B-A17B FP8 recipe (tp=4); the 122B-A10B and 35B-A3B FP8 recipes are single-GPU there.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32). For the **MXFP4 checkpoint on MI355X**, set `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` to route multi-GPU collectives through INT4-quantized ROCm quick all-reduce, and drop `--enable-aiter-allreduce-fusion` (the two are mutually exclusive; quick all-reduce is preferred for this recipe).
 - **KV cache offloading (MXFP4 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. It emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
@@ -162,6 +167,7 @@ This section provides deployment configurations optimized for different hardware
         - **B200 (183GB)** runs with tp=4 (tp=2 with expert parallelism 2 when MTP is enabled). (NVFP4)
         - **B300 (275GB)** runs with tp=2. (NVFP4)
         - **MI355X (288GB)** runs with tp=2 (use tp=4 for low concurrency). (MXFP4)
+    - **W4A8 (Ascend NPU)**: The modelslim W4A8 checkpoint ([Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp), ~236GB) runs on one Ascend A3 node (8 cards, 2 dies per card, 16 x 64GB of device memory) with `--tp-size 16`. The minimum configuration is 8 x 64GB of device memory (`--tp-size 8`): one A2 node or 4 A3 cards.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -293,6 +299,70 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 > **Note:** To enable MTP (speculative decoding), append `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
+
+**Ascend NPU (A3):**
+
+Deploy Qwen3.5-397B-A17B on a single A3 node (8 cards, PD mixed, W4A8) with the following command. It is what the generator above emits for **Ascend A3 / 3.5K+1.5K / Low Latency**, the validated low-latency operating point (22.2ms TPOT target); other workload/profile selections emit the matching recipe from the [Qwen3.5-397B best practice on Ascend NPUs](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b).
+
+```shell Command
+# Ascend A3: one node, 8 cards (16 dies), PD mixed, W4A8 (modelslim).
+# One-time host prep: CPU governor = performance, swap off, NUMA balancing off, then
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#   source /usr/local/Ascend/nnal/atb/set_env.sh
+# Point MODEL_PATH at the W4A8 checkpoint (ModelScope: Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp) and
+# set both socket interface names to your host NIC (check with `ip link`).
+export MODEL_PATH=<path-to-model-weights>
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+sglang serve \
+  --model-path $MODEL_PATH \
+  --attention-backend ascend \
+  --device npu \
+  --tp-size 16 \
+  --chunked-prefill-size -1 \
+  --max-prefill-tokens 35000 \
+  --max-total-tokens 128000 \
+  --disable-radix-cache \
+  --trust-remote-code \
+  --max-running-requests 160 \
+  --mem-fraction-static 0.8 \
+  --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 \
+  --quantization modelslim \
+  --enable-multimodal \
+  --moe-a2a-backend deepep \
+  --deepep-mode auto \
+  --mm-attention-backend ascend_attn \
+  --dtype bfloat16 \
+  --mamba-ssm-dtype bfloat16 \
+  --attn-dp-size 8 \
+  --enable-dp-lm-head \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-model-quantization unquant \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --host 0.0.0.0 \
+  --port 30000
+```
 
 ### 4.1 Basic Usage
 
